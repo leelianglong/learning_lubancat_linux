@@ -577,6 +577,11 @@ aarch64-linux-gnu-addr2line -e vmlinux -f 0xffff0000xxxxxxxx
 | 内核 oops / 挂死 | 空指针、越界、在中断里睡眠 | 读 Call trace；检查 `mutex_lock`/`kmalloc(GFP_KERNEL)` 是否在中断上下文 |
 | 串口没反应 | 波特率不是 1500000、流控没关 | 见纪实文档第一章：`1500000-8-N-1`，流控 None |
 | 板子编译不动 | 根分区只剩 3.7G | 全部改到 PC 交叉编译，产物 scp 过去 |
+| `modpost: missing MODULE_LICENSE() in xxx.o` + 加载时 `module license 'unspecified' taints kernel` | 源码里**没写** `MODULE_LICENSE("GPL")`，或写了但**没保存**（VS Code 标签页有圆点）；旧 `.o` 缓存里没有 license 段 | `grep -n MODULE_LICENSE xxx.c` 确认磁盘内容 → `make clean && make` → `modinfo xxx.ko \| grep -i license` 必须输出 `license: GPL`（**实测踩过：编辑器里看着有、磁盘上没有**） |
+| 改了代码但行为没变、`modinfo` 缺字段 | 编译其实没发生：文件未保存 / 时间戳未变 / 编的是别的目录 | 编译日志里**必须出现** `CC .../xxx.o`（只有 `CC xxx.mod.o` 就是没重编）；`make clean && make`；用 `md5sum` 对比云上与板上的 `.ko` |
+| `rmmod: ERROR: Module xxx is not currently loaded` | 本来就没装 / 已卸载 / 板子重启过 | `lsmod \| grep xxx` 确认；`insmod` 用**文件路径**（带 `.ko`），`rmmod` 用**模块名**（不带 `.ko`） |
+| `Disabling lock debugging due to kernel taint` | 之前加载过 license 缺失的模块，taint 标记**粘性**，本次开机不会消失 | 修好 license 后 `sudo reboot` 板子才彻底干净；不影响驱动功能 |
+| `rmmod` 后几秒内核 oops / `BUG: scheduling while atomic` | 定时器没停就卸载，回调还在访问已释放内存 | `mychar_exit()` **第一行**必须是 `del_timer_sync(&my_timer)` |
 
 ---
 
@@ -698,6 +703,26 @@ scp ubuntu@<云公网IP>:~/lubancat-driver/out.tgz /tmp/ && \
 2. **把 `.ko` 提交进 Git**：Linux 二进制会撑爆仓库，`.gitignore` 里加 `*.ko *.o *.mod *.mod.c *.dtbo out.tgz`。
 3. **安全组与登录**：阿里云只需放行 22 端口；务必禁用 root 密码登录、改用密钥 + 普通用户 + `sudo`；`scp` 目标目录不存在会直接失败（先 `ssh cloud 'mkdir -p ~/lubancat-driver/linux_driver'`）。
 
+### 10.6 云上代码 → Windows 仓库 → GitHub（实际在用的流程）
+
+代码只在云上写（VS Code Remote-SSH），仓库在 Windows（`github.com/leelianglong/learning_lubancat_linux`），云主机到 GitHub 网络不稳，所以**推送统一在 Windows 做**。每次改完代码，三条命令：
+
+```powershell
+cd D:\AI\deepseek\lubancat
+New-Item -ItemType Directory -Force -Path .\code | Out-Null
+scp -r root@<云公网IP>:/root/usercode/lubancat-driver/my_drivers .\code\
+git add code/ ; git commit -m "feat(driver): <改了什么>" ; git push
+```
+
+要点：
+
+- **先建 `.\code` 再 scp**，否则 `scp` 会把 `code` 当成文件名；
+- `scp -r` 会把 `.ko/.o` 一起拉下来，仓库根目录的 `.gitignore` 已挡住（`*.ko *.o *.a *.mod *.mod.c *.cmd *.dtbo .tmp_versions/ Module.symvers modules.order`），`kernel/` 也整目录忽略；
+- 想确认只会提交源码：`git add -n code/`（演练，不落地）与 `git check-ignore -v <文件>`；
+- 反向（Windows 改的上云）：`scp .\code\my_drivers\01_mychar\mychar.c root@<云IP>:/root/usercode/lubancat-driver/my_drivers/01_mychar/`；
+- **同一文件不要两边同时改**，以云上为唯一编辑地；
+- Windows 若报“未对文件进行数字签名”，用 `pwsh -NoProfile -ExecutionPolicy Bypass -File <脚本>` 绕过执行策略，或改用上面那条 `scp`（外部程序不受策略限制）。
+
 ---
 
 ## 十一、会话进展与待办
@@ -734,6 +759,30 @@ $ sudo ls /boot/dtb/overlay/
 （无回显 —— 可能是空目录，也可能路径不存在，待用 ls -la 区分）
 ```
 
+2026-11-15：内核编完 + 第一个字符设备 `mychar` 上板实测：
+
+```text
+$ modinfo helloworld.ko | grep vermagic
+vermagic:       4.19.232 SMP mod_unload aarch64      # 无 preempt → 板端 CONFIG_PREEMPT_NONE
+
+$ sudo insmod mychar.ko
+[ 1572.538162] mychar: major=236 minor=0 ready
+$ ls -l /dev/mychar
+crw------- 1 root root 236, 0 Nov 15 21:41 /dev/mychar    # udev 自动建节点
+
+$ echo "hello lubancat" | sudo tee /dev/mychar
+[ 1634.672691] mychar: open
+hello lubancat
+[ 1634.672855] mychar: write 15 bytes
+[ 1634.672898] mychar: release
+
+$ sudo cat /dev/mychar
+hello lubancat
+
+$ sudo rmmod mychar
+[ 1686.123522] mychar: exit
+```
+
 ### 11.2 决策记录（为什么这么定）
 
 | # | 决策 | 理由 |
@@ -757,7 +806,9 @@ $ sudo ls /boot/dtb/overlay/
 - [ ] **40pin 总线状态**：`ls /dev/i2c-* /dev/spidev* /dev/ttyS*`，决定是否必须编 overlay
 - [ ] 板端 `sudo apt install linux-headers-4.19.232`，`ls /lib/modules/$(uname -r)/build/Makefile` 通过
 - [x] 云主机：源码已 clone（`stable-4.19-rk356x` + 例程）；依赖与工具链改为在 Docker `ubuntu:20.04` 容器内安装（见第十二节）
-- [ ] `hello.ko` 首次 `insmod` 成功（阶段 0 毕业）
+- [x] **内核编译成功**（2026-11-15）：`Image` 25M、`Module.symvers` 698K、`kernelrelease=4.19.232`、`grep -c Error`=0
+- [x] **`hello.ko` 在板上 `insmod` 成功**（2026-11-15，`dmesg` 输出 `Hello World Module Init`；阶段 0 毕业）
+- [x] **字符设备 `/dev/mychar` 跑通**（2026-11-15）：`major=236`，udev 自动建节点，写 15 字节读出一致，`rmmod` 干净退出
 - [ ] SSD1306 接线 + `i2cdetect -y 3` 扫到 `3c`
 
 ### 11.4 进展日志
@@ -765,7 +816,10 @@ $ sudo ls /boot/dtb/overlay/
 | 日期 | 进展 |
 |---|---|
 | 2026-11-10 | 确认板卡为 2N-V3；梳理事实与决策；写出本文档第一版 |
-| 2026-11-15 | 云主机建 `/root/usercode/lubancat-driver`，clone 内核与例程；宿主机编译因 `python` 缺失和 `-Wdangling-pointer` 失败，改用 Docker `ubuntu:20.04`（gcc 9.4）方案，编译进行中 |
+| 2026-11-15 白天 | 云主机建 `/root/usercode/lubancat-driver`，clone 内核与例程；宿主机编译因 `python` 缺失和 `-Wdangling-pointer` 失败，改用 Docker `ubuntu:20.04`（gcc 9.4）方案 |
+| 2026-11-15 夜间 | 链接 `vmlinux` 连续两次 OOM（根因：`vm.swappiness=0` + `ld` 要 1.18G 峰值）；设 `swappiness=100` + `KBUILD_LDFLAGS="--no-keep-memory --reduce-memory-overheads"` 后编过：`Image` 25M、`Module.symvers` 698K、`kernelrelease` 4.19.232、`Error`=0 |
+| 2026-11-15 深夜 | **阶段 0 毕业**：云上编出 `helloworld.ko`，板端 `sudo insmod` 打印 `Hello World Module Init`，`taints kernel` 属预期 |
+| 2026-11-15 夜 | **阶段 1.2 完成**：`/dev/mychar` 字符设备跑通（`major=236`、udev 自动建节点、写读一致、`rmmod` 无 oops）；踩坑：源码未保存导致 `.ko` 缺 `MODULE_LICENSE` |
 
 ### 11.5 下次继续的三个入口
 
@@ -790,10 +844,11 @@ $ sudo ls /boot/dtb/overlay/
 ### 12.1 最短路径（复制粘贴即可，约 8 条）
 
 ```bash
-# ① 6G swap —— 1.6G 内存编内核的必需项
+# ① 6G swap + 调高 swappiness —— 1.6G 内存编内核的必需项，缺一不可
 fallocate -l 6G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
 grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-free -h | grep -i swap
+printf 'vm.swappiness=100\n' > /etc/sysctl.d/zzz-swap.conf && sysctl -w vm.swappiness=100
+free -h | grep -i swap; cat /proc/sys/vm/swappiness    # 期望 6.0Gi 与 100
 
 # ② Docker
 apt update && apt install -y docker.io && docker --version
@@ -818,8 +873,12 @@ docker exec -it kbuild bash -c 'aarch64-linux-gnu-gcc -v | tail -1'
 # ⑦ 清残留 + 生成配置（顺序不能反）
 docker exec -it kbuild bash -c 'cd /work/lubancat-driver/kernel && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- mrproper && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lubancat2_defconfig'
 
-# ⑧ 编译（35–60 分钟，可断线）
-docker exec -it kbuild bash -c 'cd /work/lubancat-driver/kernel && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j2 2>&1 | tee build.log'
+# ⑧ 编译（-j1 最稳；链接 vmlinux 是独立内存峰值，见 12.6）
+docker exec -d kbuild bash -lc 'cd /work/lubancat-driver/kernel && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j1 KBUILD_LDFLAGS="--no-keep-memory --reduce-memory-overheads" > build.log 2>&1'
+
+# 看进度（-d 已与终端解耦，断线不影响）
+docker exec kbuild tail -3 /work/lubancat-driver/kernel/build.log
+docker exec kbuild free -h
 
 # ⑨ 验证
 docker exec -it kbuild bash -c 'cd /work/lubancat-driver/kernel && ls -lh arch/arm64/boot/Image Module.symvers arch/arm64/boot/dts/rockchip/rk3568-lubancat-2n-v3.dtb && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease && grep -c Error build.log'
@@ -876,7 +935,7 @@ cp .config .config.bak && cp Module.symvers Module.symvers.bak
 
 | 检查 | 命令 | 期望 |
 |---|---|---|
-| 镜像生成 | `ls -lh arch/arm64/boot/Image` | 有文件，约 20–30MB |
+| 镜像生成 | `ls -lh arch/arm64/boot/Image` | 有文件（实测 25MB，带 DEBUG_INFO） |
 | 符号表生成 | `ls -lh Module.symvers` | 有文件 |
 | 设备树生成 | `ls arch/arm64/boot/dts/rockchip/rk3568-lubancat-2n-v3.dtb` | 存在 |
 | **版本号一致** | `make ... kernelrelease` | **必须正好是 `4.19.232`** |
@@ -898,6 +957,8 @@ make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION= kernelrelease
 | `error, forbidden warning:list.h:63` / `warning: ... [-Wdangling-pointer=]` | gcc ≥12 的新分析把 4.19 的合法写法误报，内核把警告当错误 | 换 gcc 9（容器方案）；应急可 `KCFLAGS="-w"` 或 `-Wno-dangling-pointer` |
 | 容器跑一半消失，产物也没了 | 用了 `docker run -it --rm`，SSH 断开触发退出 + 自动删除 | 改 `-dit` 常驻，`docker exec` 进入 |
 | 编译"看起来成功"但实际有错 | `make ... \| tee build.log` 的退出码是 `tee` 的，永远是 0 | 用 `grep -c Error build.log` 判断，或先 `set -o pipefail` |
+| `scripts/link-vmlinux.sh: line 101: ... Killed` + `make: *** [Makefile:1174: vmlinux] Error 137` | 链接 `vmlinux` 时 `ld` 要 **1.18G 匿名内存**，1.6G 机器扛不住；`137 = 128+9`，即 SIGKILL（OOM killer） | 加 `KBUILD_LDFLAGS="--no-keep-memory --reduce-memory-overheads"` 重跑（只重做链接，1–3 分钟）；仍不行则在容器里 `apt install -y lld` 并 `make ... LD=ld.lld`（内存约减半） |
+| `Swap` 显示 6G 空闲，进程却被 OOM 杀 | 阿里云镜像默认 **`vm.swappiness=0`**，内核几乎不换出匿名页，swap 形同虚设 | `sysctl -w vm.swappiness=100` 并写入 `/etc/sysctl.d/zzz-swap.conf`；改完重跑，`free -h` 的 `Swap used` 才会涨起来（实测涨到 130Mi 就过了） |
 
 ### 12.7 日常迭代：不需要重编内核
 

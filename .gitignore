@@ -1,0 +1,45 @@
+# Python 相关
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE 相关
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 本地测试数据库
+*.db
+*.sqlite3
+
+# 日志文件
+*.log
+
+# dsh 文件夹
+.dsh-profile-backup
+
+# ── 内核 / 驱动构建产物 ──────────────────────
+*.ko
+*.o
+*.a
+*.mod
+*.mod.c
+*.cmd
+*.dtbo
+.tmp_versions/
+Module.symvers
+modules.order
+*.tgz
+
+# ── 内核源码树（体积大，绝不入库）────────────
+kernel/
+
+# ── 本地缓存 / 临时报告 ──────────────────────
+.npm-cache/
+acl-reports/
