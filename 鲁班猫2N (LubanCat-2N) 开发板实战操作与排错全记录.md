@@ -442,6 +442,46 @@ mychar: exit
 
 ---
 
+### 5. 阶段 1.4（`sys_led` 定时器）错误清单
+
+> 现象 / 根因 / 正确做法。可运行代码与实验设计见大纲 **步骤 1.4a**。
+
+**A. 变量作用域（静默失效，最耗时）**
+
+| 现象 | 根因 | 正确做法 |
+|---|---|---|
+| ioctl 返回成功、`period` 属性却仍是 1000，速率恒 1Hz | ioctl 里声明了局部 `unsigned long period_ms`，**遮蔽全局同名变量**，赋值只写到局部 | 局部只声明 `flags, period`；或编译时加 `KCFLAGS="-Wshadow"`，它会直接报 `declaration of 'period_ms' shadows a global declaration` |
+| 同上，但这次是 `period_ms` 只被**读**、从未被**写** | ioctl 的 `else` 分支只写了 `period = period_ms; mod_timer(...)`，漏了 `period_ms = ms;` | 每个"设置"接口都要有"回读"点（如 `period` 属性），设完立刻 `cat` 校验 |
+
+**B. 构建与部署（"改了没生效"的三大来源）**
+
+| 现象 | 根因 | 正确做法 |
+|---|---|---|
+| 改完代码行为不变 | 加载的是旧 `.ko`（没重编 / `scp` 没覆盖 / `insmod` 报 `File exists` 被忽略） | ① 编译输出必须有 `CC sys_led.o`；② `md5sum` 对比云上与板上；③ **在 `pr_info` 里加版本标记**（如 `ready v2`），`dmesg` 见到 v2 才算新代码生效 |
+| `cat /sys/module/sys_led/srcversion` 报 No such file | `srcversion` 只在 `CONFIG_MODVERSIONS=y` 的内核存在；本板 vermagic 无 `modversions` 字段 | 改用 `md5sum` 或版本标记法；别把"字段不存在"当成"模块没加载" |
+
+**C. 观察手段缺失（导致反复误判）**
+
+| 现象 | 根因 | 正确做法 |
+|---|---|---|
+| 只有 `tick` 一个观测量，分不清"参数没进驱动"还是"进了没用上" | 缺少参数回读接口 | 每个可调参数配一个只读 sysfs 属性（`period`），与设定值对照 |
+| `tick` 在 `ledctl 0` 后不归零，误以为没生效 | `tick` 是只增计数器，`del_timer_sync` 只停止后续触发 | 判据看**增量**（3 秒 +0），不是绝对值；要归零得额外实现 reset |
+
+**D. 崩溃级后果（漏 `del_timer_sync`）**
+
+| 现象 | 根因 | 正确做法 |
+|---|---|---|
+| `rmmod` 后 SSH 立即断开，`ping` 都 `无法访问目标主机`，必须断电重启 | 模块代码页已释放，定时器仍在软中断上下文执行 `sys_led_timer_fn` → `Fatal exception in interrupt` → **panic**（不是普通 oops，内核无法只杀进程） | `del_timer_sync()` 放 `exit` 第一行；任何"定时器/工作队列/中断 + 卸载"都要用对应的 `*_sync` / `cancel_*` |
+| 崩溃现场没留下日志 | panic 时 SSH 必然断，`dmesg` 也随重启清空 | **这类实验必须挂串口控制台**（1500000 8N1，流控 None），串口会完整打印 oops 与 panic 文本 |
+
+**E. 板端存储：`/tmp` 是 tmpfs**
+
+| 现象 | 根因 | 正确做法 |
+|---|---|---|
+| 重启后 `/tmp` 下的 `.ko`、`race_test.sh`、`ledctl.c`、`ledctl` 全没了 | `df -h` 可见 `/tmp` 挂的是 `tmpfs 982M`（内存盘），掉电即清空 | **源码/脚本/测试程序放云上 `my_drivers/<实验>/` 并入 Git**；`/tmp` 只放可再生的编译产物；需长期留在板上的放 `/home/cat/` |
+
+---
+
 ## 十一、 远程通道与断线处理
 
 ### 1. 五种入口的定位

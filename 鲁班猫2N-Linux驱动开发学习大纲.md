@@ -804,6 +804,218 @@ Call Trace: ...
 
 **验收物**：`sys_led` 驱动 —— `/dev/sys_led` 支持 `write` 开关灯、`read` 回读状态、`ioctl` 设置闪烁频率（定时器实现），全程互斥锁保护，`rmmod` 无 oops。
 
+#### 步骤 1.4a 示例：定时器 + ioctl 的 `sys_led`（可跑）
+
+**目录**：`my_drivers/03_sys_led/`，含 `sys_led.c`、`Makefile`、`ledctl.c`（用户态测试程序）
+
+**对外接口**
+
+| 接口 | 用法 | 说明 |
+|---|---|---|
+| `/dev/sys_led` write | `echo 1 > /dev/sys_led` | 开/关灯（`kstrtobool_from_user` 解析） |
+| `/dev/sys_led` read | `cat /dev/sys_led` | 回读 `"1\n"`/`"0\n"` |
+| ioctl `SYS_LED_SET_PERIOD` | `ledctl 200` | 设闪烁周期（ms），`0` = 停止 |
+| `/sys/class/sys_led/sys_led/tick` | `cat` | 定时器累计触发次数（只读） |
+| `/sys/class/sys_led/sys_led/period` | `cat` | **当前生效周期（只读回读点，排查必备）** |
+
+**关键实现要点**（完整代码见仓库 `my_drivers/03_sys_led/sys_led.c`）
+
+① 锁必须用 `spinlock`，不能用 `mutex`（回调在软中断上下文）：
+
+```c
+static DEFINE_SPINLOCK(s_lock);
+static bool          led_on;
+static unsigned long tick;
+static unsigned long period_ms = DEFAULT_MS;
+```
+
+② 回调：先更新状态并**在锁内取当前周期**，再续期：
+
+```c
+static void sys_led_timer_fn(struct timer_list *t)
+{
+	unsigned long flags, period;
+
+	spin_lock_irqsave(&s_lock, flags);
+	led_on = !led_on;
+	tick++;
+	period = period_ms;                  /* 必须在锁内读 */
+	spin_unlock_irqrestore(&s_lock, flags);
+
+	mod_timer(&my_timer, jiffies + msecs_to_jiffies(period));  /* 用变量，不能写死常量 */
+}
+```
+
+③ ioctl：**校验 → 停或改 → 重新武装**，且必须真的写入全局变量：
+
+```c
+	case SYS_LED_SET_PERIOD:
+		if (copy_from_user(&ms, (int __user *)arg, sizeof(ms)))
+			return -EFAULT;
+		if (ms != 0 && ms < MIN_MS)
+			return -EINVAL;
+
+		if (ms == 0) {
+			del_timer_sync(&my_timer);
+			return 0;
+		}
+
+		spin_lock_irqsave(&s_lock, flags);
+		period_ms = ms;                  /* ← 少这一行就会"设置成功但不生效" */
+		period = period_ms;
+		spin_unlock_irqrestore(&s_lock, flags);
+
+		mod_timer(&my_timer, jiffies + msecs_to_jiffies(period));
+		return 0;
+```
+
+④ `read` 不能在持锁时 `copy_to_user`（可能睡眠）：
+
+```c
+	spin_lock_irqsave(&s_lock, flags);
+	on = led_on;                         /* 锁内只取值 */
+	spin_unlock_irqrestore(&s_lock, flags);
+
+	buf[0] = on ? '1' : '0';
+	buf[1] = '\n';
+	if (copy_to_user(ub, buf, 2))        /* 放锁后再拷贝 */
+		return -EFAULT;
+	*ppos += 2;
+	return 2;
+```
+
+⑤ 卸载：`del_timer_sync()` 必须是第一行，否则 `rmmod` 后内核崩溃（实测为 panic 级，见纪实第十章第 5 节 D 组）：
+
+```c
+static void __exit sys_led_exit(void)
+{
+	del_timer_sync(&my_timer);           /* ← 第一行 */
+	device_remove_file(dev, &dev_attr_period);
+	device_remove_file(dev, &dev_attr_tick);
+	device_destroy(cls, devno);
+	class_destroy(cls);
+	cdev_del(&cdev);
+	unregister_chrdev_region(devno, 1);
+	pr_info("%s: exit\n", DEV_NAME);
+}
+```
+
+**用户态测试程序 `ledctl.c`**（板子上 `gcc -o ledctl ledctl.c`）
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+
+#define SYS_LED_MAGIC       'L'
+#define SYS_LED_SET_PERIOD  _IOW(SYS_LED_MAGIC, 1, int)
+
+int main(int argc, char **argv)
+{
+	int fd, ms;
+
+	if (argc != 2) {
+		fprintf(stderr, "usage: %s <period_ms>  (0 = stop)\n", argv[0]);
+		return 1;
+	}
+	ms = atoi(argv[1]);
+
+	fd = open("/dev/sys_led", O_RDWR);
+	if (fd < 0) { perror("open"); return 1; }
+
+	if (ioctl(fd, SYS_LED_SET_PERIOD, &ms) < 0) {
+		perror("ioctl");
+		close(fd);
+		return 1;
+	}
+	printf("period set to %d ms\n", ms);
+	close(fd);
+	return 0;
+}
+```
+
+**执行顺序（勿跳步）**
+
+1. 云上容器 `make` → 产出 `sys_led.ko`；
+2. `scp` 到板子 `/tmp/`（`/tmp` 是 tmpfs，重启即清空，源码不要只放板子）；
+3. `insmod` → 核对 `/sys/class/sys_led/sys_led/dev` 与 `/dev/sys_led`；
+4. 板上传 `ledctl.c` 并 `gcc` 编译；
+5. 跑实验 1–3；
+6. `rmmod` 验证无 oops。
+
+```bash
+# 云上
+docker exec -it kbuild bash -lc 'cd /work/lubancat-driver/my_drivers/03_sys_led && make'
+
+# 板上
+scp root@<云公网IP>:/root/usercode/lubancat-driver/my_drivers/03_sys_led/{sys_led.ko,ledctl.c} /tmp/
+gcc -o /tmp/ledctl /tmp/ledctl.c
+sudo dmesg -C
+sudo insmod /tmp/sys_led.ko
+dmesg | tail -2                                  # sys_led: ready ...
+cat /sys/class/sys_led/sys_led/period            # 1000
+```
+
+**实验 1：周期生效性（最关键，必须用 `period` 回读确认）**
+
+```bash
+for ms in 100 200 500 1000; do
+	sudo /tmp/ledctl $ms
+	p=$(cat /sys/class/sys_led/sys_led/period)
+	a=$(cat /sys/class/sys_led/sys_led/tick); sleep 10
+	b=$(cat /sys/class/sys_led/sys_led/tick)
+	echo "设定 ${ms}ms → period=${p} → 10 秒 $((b-a)) 次（理论 $((10000/ms))）"
+done
+```
+
+| 设定 | `period` 应显示 | 10 秒理论次数 | 实测 |
+|---|---|---|---|
+| 100 ms | 100 | ≈100 | （待补） |
+| 200 ms | 200 | ≈50 | **3 秒 +15（精确，2026-11-22）** |
+| 500 ms | 500 | ≈20 | （待补） |
+| 1000 ms | 1000 | ≈10 | 10 秒 +10（实测） |
+
+判读三条：`period` 必须等于设定值；次数接近理论值（允许 ±1 的相位误差）；`period` 没变说明参数没进驱动。
+
+**实验 2：停止与恢复**
+
+```bash
+sudo /tmp/ledctl 0
+a=$(cat /sys/class/sys_led/sys_led/tick); sleep 3
+b=$(cat /sys/class/sys_led/sys_led/tick)
+echo "停止后 3 秒 +$((b-a))（应为 0）"
+
+sudo /tmp/ledctl 200
+a=$(cat /sys/class/sys_led/sys_led/tick); sleep 3
+b=$(cat /sys/class/sys_led/sys_led/tick)
+echo "恢复 200ms 后 3 秒 +$((b-a))（应 ≈15）"
+```
+
+> 注意：`tick` 是**只增不减**的累计值，`ledctl 0` 只让它**停止增长**，不会归零。
+
+**实验 3：漏掉 `del_timer_sync` 的后果（危险，建议接串口做）**
+
+1. 注释 `sys_led_exit()` 里的 `del_timer_sync(&my_timer);`；
+2. 重编、`insmod`、`ledctl 100`（周期短，回调几乎总在跑）、`sleep 2`、`rmmod`；
+3. 观察：串口/`dmesg` 出现 `Unable to handle kernel paging request` → `Call trace: sys_led_timer_fn` → **`Kernel panic - not syncing: Fatal exception in interrupt`**；
+4. 外部表现：**SSH 立即断开、板子失联、需断电重启**（本项目实测如此）；
+5. 恢复代码 → 重编重载 → 确认 `rmmod` 干净。
+
+⚠️ 这个实验会**整机崩溃**，且 SSH 断线会丢失现场。**必须在串口控制台（1500000 8N1）下做**，否则你只能看到"断了"，拿不到 oops 文本。
+
+**验收清单**
+
+- [ ] `tick` 按设定周期增长（四档可验）
+- [ ] `period` 回读与设定一致
+- [ ] `write`/`read` 值一致
+- [ ] `ledctl 0` 后 `tick` 停止增长
+- [ ] `rmmod` 后 `/dev/sys_led`、`/sys/class/sys_led` 消失，`dmesg` 无 oops
+- [ ] （实验 3）观察到 panic 级后果，并已恢复代码
+
+> 本节的排错过程（变量遮蔽、旧 `.ko`、只读未写、panic）见纪实文档第十章第 5 节；**不要**在这里重复踩一遍。
+
 ---
 
 ### 阶段 2 设备模型 / 设备树 / 中断（第 5–7 周）
