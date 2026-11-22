@@ -238,7 +238,7 @@ cd ~/lubancat-driver && tar -czf out-$(date +%m%d).tgz \
 2. 注册 `cdev`：`cdev_init()` + `cdev_add()`；卸载时 `cdev_del()` + `unregister_chrdev_region()`
 3. `file_operations`：`.open/.release/.read/.write/.unlocked_ioctl`（4.19 只有 `unlocked_ioctl`，没有 `.ioctl`）
 4. 用户态数据交换：`copy_to_user/copy_from_user`（返回"未拷贝字节数"，务必判错）
-5. 自动建节点：`class_create()` + `device_create()`（依赖 `systemd-udevd`），或手写 `mknod`
+5. 自动建节点：`class_create()` + `device_create()`（依赖 `systemd-udevd`），或手写 `mknod`（**原理、"是否必须"、替代方案见步骤 1.2a；用户态能看到哪些属性见 1.2b**）
 6. 权限：`/etc/udev/rules.d/99-lubancat.rules` 里 `KERNEL=="mychar", MODE="0666"`
 
 **Makefile 模板（通用，后续所有实验复用）**：
@@ -256,9 +256,153 @@ clean:
 	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR) clean
 ```
 
+#### 步骤 1.2a 设备模型三层：cdev / class+device / devtmpfs+udev（原理）
+
+字符设备"能用"和"好用"是三件事叠起来的（以 `mychar` 为例）：
+
+| 层 | 负责什么 | 代码位置 |
+|---|---|---|
+| ① 内核路由 | `open("/dev/mychar")` 能否找到你的 `fops` | `alloc_chrdev_region()` + `cdev_add()` |
+| ② 设备模型 / sysfs | 设备在 `/sys` 有入口、能挂属性、能上报事件 | `class_create()` + `device_create()` |
+| ③ `/dev` 节点 | 节点文件的创建与权限 | devtmpfs（内核建节点）+ udev（定权限、跑规则） |
+
+**`class_create()` 做了什么**
+
+在 `/sys/class/` 下建一个"类"目录（`/sys/class/mychar/`）。"类"是**功能分类**，与物理拓扑无关——对照 `/sys/class/net`、`/sys/class/tty`、`/sys/class/leds` 就明白了。
+
+```c
+/* 4.19：owner + 名字；注意 6.4 之后签名变为 class_create(name) */
+my_class = class_create(THIS_MODULE, DEV_NAME);
+if (IS_ERR(my_class)) {              /* 返回 ERR_PTR，必须这样判错 */
+	ret = PTR_ERR(my_class);
+	goto err_class;
+}
+```
+
+**`device_create()` 做了什么**
+
+在类下注册一个具体设备，一次产生三样东西：
+
+1. sysfs 目录 `/sys/class/mychar/mychar/`，自动带 `dev`（内容 `236:0`）、`uevent`、`subsystem`、`power/`；
+2. 向用户态发 `KOBJ_ADD` 的 uevent；
+3. devtmpfs 建出 `/dev/mychar`，默认权限 `crw-------`（所以 `echo` 要 `sudo tee`）。
+
+```c
+my_device = device_create(my_class, NULL, devno, NULL, DEV_NAME);
+/*                         类    父设备  设备号 私有数据 节点名 */
+```
+
+**`class_create()` 是必须的吗？**
+
+| 目标 | 必须？ | 替代方案 |
+|---|---|---|
+| 驱动能被 `open/read/write`（功能可用） | ❌ **不必**，`cdev_add()` 已够 | `sudo mknod /dev/mychar c <major> 0` |
+| `/dev` 节点自动出现、权限可管 | ✅ | `misc_register()` 内部替你建 |
+| 能挂 sysfs 属性（如 `stats`） | ✅ 要拿到 `struct device *` | `debugfs` / `/proc` |
+| 能向 udev 上报热插拔事件 | ✅ | 无 |
+
+自己验证"功能层面不必须"：把 `class_create`/`device_create` 两段注释掉，`insmod` 后手动建节点，读写照样工作：
+
+```bash
+sudo insmod mychar.ko
+sudo mknod /dev/mychar c 236 0     # major 取 dmesg 里打印的值
+sudo chmod 666 /dev/mychar
+echo hi > /dev/mychar              # 可用
+```
+
+但代价明确：`alloc_chrdev_region()` 是**动态分配**，主设备号每次启动可能变（236 → 240），`mknod` 无法固化；没有 `/sys` 入口，属性无处安放；重启后权限丢失。
+
+**更省事的替代：`misc_register()`**（单设备够用，主设备号固定 10，自动出现在 `/sys/class/misc/` 与 `/dev/`）：
+
+```c
+static struct miscdevice my_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "mychar",
+	.fops  = &my_fops,
+};
+misc_register(&my_misc);           /* 卸载用 misc_deregister() */
+```
+
+**创建与销毁必须对称**
+
+```
+创建：alloc_chrdev_region → cdev_add → class_create → device_create
+销毁：device_destroy → class_destroy → cdev_del → unregister_chrdev_region
+```
+
+错误回退用 `goto err_xxx` 逐级回滚（见 `mychar.c` 的 `err_device / err_class / err_cdev`）。
+
+#### 步骤 1.2b 字符设备的用户态接口地图
+
+一个字符设备在用户态能看到的入口：
+
+| 路径 | 谁创建 | 内容 | 可写 |
+|---|---|---|---|
+| `/dev/mychar` | devtmpfs + udev | 设备节点 `crw------- 236,0` | 用 read/write/ioctl |
+| `/sys/class/mychar/mychar/` | `class_create`+`device_create` | **你的属性**（`stats`）+ 标准属性 | 取决于属性 mode |
+| `/sys/devices/virtual/mychar/mychar/` | 同上（**真身**） | 与上一行同一个目录，`/sys/class/...` 只是软链 | 同上 |
+| `/sys/dev/char/236:0` | driver core | 按设备号反查设备的软链 | 只读 |
+| `/sys/module/mychar/` | 模块加载器 | `parameters/`、`refcnt`、`sections/`、`taint` | `parameters` 可写 |
+| `/proc/devices` | 内核 | 字符设备主设备号注册表 | 只读 |
+
+**sysfs 是"同一批设备的不同视角"**，本体都在 `/sys/devices` 下：
+
+```text
+/sys/
+├── devices/virtual/mychar/mychar/     ← 真身 kobject
+│   ├── dev            "236:0"
+│   ├── uevent         （可 echo add 重发事件）
+│   ├── subsystem -> ../../../../class/mychar
+│   ├── power/         control  runtime_status  autosuspend_delay_ms  wakeup
+│   └── stats          你自己加的属性
+├── class/mychar/mychar -> ../../devices/virtual/mychar/mychar    （软链）
+├── dev/char/236:0 -> ../../../devices/virtual/mychar/mychar      （软链）
+├── module/mychar/{parameters,refcnt,taint,sections,...}
+└── kernel/debug/                      （debugfs，需 mount -t debugfs）
+```
+
+**`device_create()` 之后天然就有的标准属性**：`dev`（设备号）、`uevent`（可写，触发 udev 重处理）、`subsystem`（软链）、`driver`（平台设备有）、`power/*`（运行时电源管理）、`modalias`（有驱动时）。
+
+**能自己挂的 7 类属性**
+
+| 想暴露什么 | API | 出现位置 |
+|---|---|---|
+| 设备级属性（每设备一份） | `DEVICE_ATTR_RO/RW/WO` + `device_create_file()`；或多设备用 `dev_groups` | `/sys/class/<cls>/<dev>/xxx` |
+| 类级属性（同类共享） | `CLASS_ATTR_*` + `class_create_file()` | `/sys/class/<cls>/xxx` |
+| 驱动级属性 | `DRIVER_ATTR_*` + `driver_create_file()` | `/sys/bus/.../drivers/<drv>/xxx` |
+| 模块参数 | `module_param()` | `/sys/module/<mod>/parameters/xxx` |
+| 调试接口 | `debugfs_create_file/dir()` | `/sys/kernel/debug/<drv>/xxx` |
+| 老式 proc 接口 | `proc_create()` | `/proc/<name>`（新代码不推荐） |
+| 非文件接口 | `ioctl` / `mmap` / `poll` / `fasync` | 走 `/dev/<node>` |
+
+**各子系统惯例**：input → `/sys/class/input/` + `/dev/input/eventX`；IIO → `/sys/bus/iio/devices/iio:deviceX/`；hwmon → `/sys/class/hwmon/hwmonX/`；LED → `/sys/class/leds/<name>/`；RTC → `/sys/class/rtc/rtc0/` + `/dev/rtc0`；PWM → `/sys/class/pwm/pwmchipX/pwmY/`；TTY → `/sys/class/tty/ttyS3/`；GPIO → `/dev/gpiochipX` + `/sys/bus/gpio/`。
+
+**设计原则**
+
+| 内容 | 放哪 | 理由 |
+|---|---|---|
+| 配置项、状态计数（`stats`、`period_ms`） | sysfs | 一值一文件、纯文本、可脚本化 |
+| 二进制数据、复杂事务（刷屏、读采样块） | ioctl / read / write | sysfs 不适合大块与二进制 |
+| 调试信息（寄存器 dump、内部快照） | debugfs | 不承诺 ABI 稳定 |
+| 模块级开关 | `module_param` | 加载时即可配 |
+
+三条铁律：**一个文件只表达一个值**；**读不应有副作用**；**属性名一旦发布就不要改**（用户态脚本会依赖）。
+
+**在板上自查（可直接跑）**
+
+```bash
+ls -l /sys/class/mychar/mychar/                       # dev power stats subsystem uevent
+ls -i /sys/class/mychar/mychar/stats /sys/devices/virtual/mychar/mychar/stats   # 同一个 inode
+ls -l /sys/dev/char/236:0                             # 按设备号反查
+ls /sys/module/mychar/ ; cat /sys/module/mychar/refcnt
+grep mychar /proc/devices
+udevadm info -q all -n /dev/mychar                    # 属性与 udev 规则的来源
+echo add | sudo tee /sys/class/mychar/mychar/uevent   # 手动重发事件
+```
+
 #### 步骤 1.3 并发与竞争（3 天）
 
-同一驱动里分别用三种方式保护共享变量，然后用两个终端并发读写作对比：
+同一驱动里分别用三种方式保护共享变量，然后用两个终端并发读写作对比（**可直接跑的四计数器示例与四个实验见步骤 1.3a**）：
 
 - 原子变量 `atomic_t`（计数器）
 - 互斥锁 `mutex`（可睡眠上下文，最常用）
@@ -266,6 +410,391 @@ clean:
 - 补充概念：信号量、`completion`、RCU（读多写少）、内存屏障与 `READ_ONCE/WRITE_ONCE`
 
 **铁律**：中断上下文不能睡眠 → 不能 `mutex_lock`、不能 `kmalloc(GFP_KERNEL)`、不能 `copy_to_user`。
+
+#### 步骤 1.3a 示例：四个计数器对比（race_demo）——亲眼看到"丢更新"
+
+**目标**：同一个驱动里放四个计数器，分别用 **无保护 / 原子变量 / 互斥锁 / 自旋锁**，跑同一组并发压力，用数据证明"竞态"不是理论。
+
+**目录**：`my_drivers/02_race/race_demo.c`（与 `01_mychar` 同级）
+
+> **执行顺序（勿跳步）**：① 写 `race_demo.c` 与 `Makefile` → ② 云上容器 `make` → ③ `scp` 到板子 `/tmp/` → ④ `insmod` → ⑤ 核对节点名与权限（`/dev/<DEV_NAME>`、`crw-------` 需 `sudo`）→ ⑥ 跑实验 1–3（实验 4 可选）→ ⑦ `rmmod` 验证无 oops。
+> 本文档只给"跑得通"的路径与实验数据；**错误命令、排查过程、踩坑现象**见同目录《鲁班猫2N (LubanCat-2N) 开发板实战操作与排错全记录.md》**第十章**。
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/cdev.h>
+#include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
+#include <linux/delay.h>
+
+#define DEV_NAME "racedev"
+#define WIN_US   50            /* 人为放大竞态窗口（微秒），否则很难观测到 */
+
+static dev_t          devno;
+static struct cdev    cdev;
+static struct class  *cls;
+static struct device *dev;
+
+/* 四个计数器，分别演示四种"保护"方式 */
+static unsigned long cnt_plain;                       /* 无保护 */
+static atomic_t      cnt_atomic = ATOMIC_INIT(0);     /* 原子变量 */
+static unsigned long cnt_mutex;                       /* 受 m_lock 保护 */
+static unsigned long cnt_spin;                        /* 受 s_lock 保护 */
+
+static DEFINE_MUTEX(m_lock);
+static DEFINE_SPINLOCK(s_lock);
+
+static ssize_t demo_write(struct file *f, const char __user *ub,
+			  size_t n, loff_t *ppos)
+{
+	unsigned long tmp;
+
+	/* ① 无保护：读-改-写 三步不是原子的，中间可被抢走 */
+	tmp = cnt_plain;
+	udelay(WIN_US);                 /* 放大窗口：模拟"耗时的计算" */
+	cnt_plain = tmp + 1;
+
+	/* ② 原子变量：一条指令完成，不会被拆开 */
+	atomic_inc(&cnt_atomic);
+
+	/* ③ 互斥锁：临界区可睡眠（这里用 udelay 只为对比，实际可 msleep） */
+	mutex_lock(&m_lock);
+	tmp = cnt_mutex;
+	udelay(WIN_US);
+	cnt_mutex = tmp + 1;
+	mutex_unlock(&m_lock);
+
+	/* ④ 自旋锁：临界区不可睡眠，只适合极短操作 */
+	spin_lock(&s_lock);
+	tmp = cnt_spin;
+	udelay(WIN_US);                 /* 自旋锁内只能 udelay，绝不能 msleep */
+	cnt_spin = tmp + 1;
+	spin_unlock(&s_lock);
+
+	return n;
+}
+
+static const struct file_operations demo_fops = {
+	.owner = THIS_MODULE,
+	.write = demo_write,
+};
+
+/* /sys/class/racedev/racedev/stats —— 读四个计数 */
+static ssize_t stats_show(struct device *d, struct device_attribute *a, char *buf)
+{
+	return sprintf(buf, "plain=%lu\natomic=%d\nmutex=%lu\nspin=%lu\n",
+		       cnt_plain, atomic_read(&cnt_atomic), cnt_mutex, cnt_spin);
+}
+static DEVICE_ATTR_RO(stats);
+
+/* /sys/class/racedev/racedev/reset —— 清零（写任意内容即可） */
+static ssize_t reset_store(struct device *d, struct device_attribute *a,
+			   const char *buf, size_t n)
+{
+	cnt_plain = 0;
+	atomic_set(&cnt_atomic, 0);
+	mutex_lock(&m_lock); cnt_mutex = 0; mutex_unlock(&m_lock);
+	spin_lock(&s_lock);  cnt_spin  = 0; spin_unlock(&s_lock);
+	return n;
+}
+static DEVICE_ATTR_WO(reset);
+
+static int __init racedev_init(void)
+{
+	int ret;
+
+	ret = alloc_chrdev_region(&devno, 0, 1, DEV_NAME);
+	if (ret)
+		return ret;
+
+	cdev_init(&cdev, &demo_fops);
+	cdev.owner = THIS_MODULE;
+	ret = cdev_add(&cdev, devno, 1);
+	if (ret)
+		goto err_cdev;
+
+	cls = class_create(THIS_MODULE, DEV_NAME);
+	if (IS_ERR(cls)) {
+		ret = PTR_ERR(cls);
+		goto err_class;
+	}
+
+	dev = device_create(cls, NULL, devno, NULL, DEV_NAME);
+	if (IS_ERR(dev)) {
+		ret = PTR_ERR(dev);
+		goto err_dev;
+	}
+
+	device_create_file(dev, &dev_attr_stats);
+	device_create_file(dev, &dev_attr_reset);
+
+	pr_info("%s: ready, major=%d\n", DEV_NAME, MAJOR(devno));
+	return 0;
+
+err_dev:
+	class_destroy(cls);
+err_class:
+	cdev_del(&cdev);
+err_cdev:
+	unregister_chrdev_region(devno, 1);
+	return ret;
+}
+
+static void __exit racedev_exit(void)
+{
+	device_remove_file(dev, &dev_attr_reset);
+	device_remove_file(dev, &dev_attr_stats);
+	device_destroy(cls, devno);
+	class_destroy(cls);
+	cdev_del(&cdev);
+	unregister_chrdev_region(devno, 1);
+	pr_info("racedev: exit\n");
+}
+
+module_init(racedev_init);
+module_exit(racedev_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("LubanCat concurrency demo: plain/atomic/mutex/spinlock");
+```
+
+**Makefile**（与 `01_mychar` 同款，只改 `obj-m`）：
+
+```makefile
+obj-m := race_demo.o
+KERNEL_DIR ?= ../../kernel
+ARCH ?= arm64
+CROSS_COMPILE ?= aarch64-linux-gnu-
+
+all:
+	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR) modules ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE)
+clean:
+	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR) clean
+```
+
+> 文件名 `race_demo.c` → 产物 `race_demo.ko`；`DEV_NAME` 是 `racedev` → 节点 `/dev/racedev`、属性 `/sys/class/racedev/racedev/`。
+>
+> ⚠️ **三个名字别混**：**文件** `race_demo.ko`（`insmod` 用路径）、**模块名** `race_demo`（`rmmod`/`lsmod` 用）、**设备名** `racedev`（`/dev`、`/sys`、`/proc/devices` 用）。一旦改了 `DEV_NAME`，后三者全跟着变；`pr_info` 里不要写死名字（用 `%s", DEV_NAME`），否则日志与实际设备名对不上，排查会被带偏。踩坑经过见纪实文档第十章第 4 节 A 组。
+
+**编译与加载**
+
+```bash
+# 云上（容器内）
+docker exec -it kbuild bash -lc 'cd /work/lubancat-driver/my_drivers/02_race && make'
+
+# 板子上
+scp root@<云公网IP>:/root/usercode/lubancat-driver/my_drivers/02_race/race_demo.ko /tmp/
+sudo dmesg -C
+sudo insmod /tmp/race_demo.ko
+dmesg | tail -2                                  # racedev: ready, major=xxx
+ls -l /dev/racedev
+sudo chmod 666 /dev/racedev                      # 方便普通用户跑测试
+cat /sys/class/racedev/racedev/stats             # 四项全 0
+```
+
+> **源码与脚本同目录**：`my_drivers/02_race/` 下应有四个文件——`race_demo.c`、`Makefile`、`race_test.sh`、`race_loop.sh`（云上路径 `/root/usercode/lubancat-driver/my_drivers/02_race/`）。脚本**不要只放在板子的 `/tmp`**：重启会清空，也没法进 Git 仓库。取到板上：
+>
+> ```bash
+> scp root@<云公网IP>:/root/usercode/lubancat-driver/my_drivers/02_race/race_test.sh /tmp/
+> scp root@<云公网IP>:/root/usercode/lubancat-driver/my_drivers/02_race/race_loop.sh /tmp/
+> chmod +x /tmp/race_test.sh /tmp/race_loop.sh
+> ```
+>
+> 反过来，板子上临时写的脚本要回传到云上留底（板子能连云主机）：
+>
+> ```bash
+> scp /tmp/race_test.sh /tmp/race_loop.sh root@<云公网IP>:/root/usercode/lubancat-driver/my_drivers/02_race/
+> ```
+
+**测试脚本** `race_test.sh`（放板上，`chmod +x`）
+
+```bash
+#!/bin/bash
+# 用法：sudo ./race_test.sh [进程数] [每进程次数]
+DEV=/dev/racedev
+STATS=/sys/class/racedev/racedev/stats
+RESET=/sys/class/racedev/racedev/reset
+P=${1:-10}
+N=${2:-100}
+TOTAL=$((P * N))
+
+[ "$(id -u)" -ne 0 ] && { echo "请用 sudo 运行：sudo $0 $*"; exit 1; }
+
+echo 1 > $RESET
+echo "并发 $P 进程 × $N 次 = $TOTAL 次写入"
+
+start=$(date +%s%N)
+for i in $(seq $P); do
+	( for j in $(seq $N); do echo x > $DEV; done ) &
+done
+wait
+end=$(date +%s%N)
+
+echo "--- stats ---"
+cat $STATS
+echo "--- 期望：四个计数器都应等于 $TOTAL ---"
+echo "耗时 $(( (end - start) / 1000000 )) ms"
+```
+
+**循环脚本** `race_loop.sh`（连跑 5 轮，看方差）
+
+```bash
+#!/bin/bash
+# 用法：sudo ./race_loop.sh [轮数]
+ROUNDS=${1:-5}
+
+for k in $(seq $ROUNDS); do
+	echo "== 第 $k 轮 =="
+	sudo /tmp/race_test.sh 10 100 | grep -E 'plain|atomic|mutex|spin'
+done
+```
+
+> 若 `seq` 不存在（极简 busybox），把 `$(seq $ROUNDS)` 换成 `1 2 3 4 5`，或 `for ((k=1;k<=ROUNDS;k++))`。
+> 一行版（不建文件也能跑）：`for k in 1 2 3 4 5; do echo "== 第 $k 轮 =="; sudo /tmp/race_test.sh 10 100 | grep -E 'plain|atomic|mutex|spin'; done`
+
+**实测环境**（本文所有实测数据均来自这套环境，便于复现对照）：
+
+| 项 | 值 |
+|---|---|
+| 板卡 | LubanCat-2N **V3**（RK3568，4×Cortex-A55 @2.0GHz） |
+| 系统 / 内核 | Debian 10 (buster) / **4.19.232**（`CONFIG_PREEMPT_NONE`，vermagic 无 `preempt`） |
+| 驱动编译 | Docker `ubuntu:20.04` 内 gcc 9.4，`WIN_US=50`，`-j1` |
+| 测试参数 | 10 进程 × 100 次写入（共 1000 次），连跑 5 轮 |
+| 测试时间 | 2026-11-22 下午 |
+| 观察方式 | `cat /sys/class/racedev/racedev/stats`，脚本自动 `reset` 后统计 |
+
+**实验 1：并发压力，看谁丢更新**
+
+> **运行前提**：测试脚本必须 `sudo`（写 `/dev` 节点、以及脚本开头往 sysfs 写 `reset` 都需要 root）；每次重新 `insmod` 后节点权限会重置为 `crw-------`。不加 sudo 的具体现象与排查见纪实文档第十章第 4 节 B 组。
+
+```bash
+chmod +x /tmp/race_test.sh /tmp/race_loop.sh
+sudo /tmp/race_test.sh 10 100
+```
+
+预期（4 核 Cortex-A55，`WIN_US=50`）：
+
+| 计数器 | 预期值 | 典型实测 | 结论 |
+|---|---|---|---|
+| `plain` | **< 1000** | **767**（2026-11-22 实测，10×100，总耗时 107 ms） | 读-改-写被交错，**丢更新 233 次≈23%** |
+| `atomic` | 1000 | 1000（实测精确） | 原子加，精确 |
+| `mutex` | 1000 | 1000（实测精确） | 互斥，精确 |
+| `spin` | 1000 | 1000（实测精确） | 自旋锁，精确 |
+
+> 丢 20%–30% 属典型：窗口 50µs、10 进程抢 4 核，只有"两个 CPU 同时在窗口内"时才丢。把 `WIN_US` 调大到 200，`plain` 通常掉到 500 以下。
+
+为什么 `plain` 会少：
+
+```text
+CPU0: tmp = cnt_plain (100) ──────┐
+CPU1: tmp = cnt_plain (100) ───┐  │
+CPU0: cnt_plain = 101          │  │   ← 两次 +1 只落了一次
+CPU1: cnt_plain = 101          │  │
+```
+
+**实验 2：连跑 5 次，看"稳定性"**
+
+```bash
+sudo /tmp/race_loop.sh 5
+
+# 等价的一行版（不建脚本文件也能跑）
+for k in $(seq 5); do echo "== 第 $k 轮 =="; sudo /tmp/race_test.sh 10 100 | grep -E 'plain|atomic|mutex|spin'; done
+```
+
+| 计数器 | 5 轮表现 | 实测（2026-11-22，10 进程 ×100 次） |
+|---|---|---|
+| `plain` | 每轮都不同，且**永远 < 1000** | 712 / 713 / 721 / 735 / 778（跨度 66，丢失率 22%–29%） |
+| `atomic` / `mutex` / `spin` | 每轮**恰好 1000**，零波动 | 1000 ×5，完全一致 |
+
+> 结论：竞态不是"必然丢"，而是**概率性丢**——只有两个 CPU 恰好同时在窗口内才丢一次。这正是竞态难查的根源：它能"跑通"大部分时间，只在压力大时偶发出错。有锁的三个计数器方差为 0，说明锁把"不确定"变成了"确定"。
+
+这就是"竞态"的工程定义：**结果依赖执行时序**。
+
+**实验 3：破坏—观察—修复**
+
+- 把 ③ 的 `mutex_lock/unlock` 注释掉（保留 `udelay`）→ 重编重载 → 再跑：`mutex` 也开始小于 1000（证明锁真在起作用）；
+- 同样注释 ④ 的 `spin_lock/unlock` → `spin` 也开始丢；
+- 恢复代码 → `make` → 重新 `insmod` → 数值回到 1000。
+
+> ⚠️ 只注释 `lock` 不注释 `unlock`（或反过来）会在 `rmmod` 时报 `mutex_destroy() ... busy` 甚至卡死；必须**成对**处理，中间三行（读、`udelay`、写）保留，否则计数器不增长、看不到"丢更新"。
+> ⚠️ 重编后 `/dev/racedev` 会被 devtmpfs 重建为 `crw-------`，必须 `sudo` 跑测试脚本（脚本里的 `reset` 也写 `/sys`，同样需要 root）。
+
+实测对照（2026-11-22，10 进程 ×100 次，5 轮）：
+
+| 计数器 | 有锁 | 去掉 mutex 后 | 说明 |
+|---|---|---|---|
+| `plain` | 712–778 | 708–743 | 本来无保护，一直丢 |
+| `atomic` | 1000 ×5 | 1000 ×5 | 原子操作不依赖锁 |
+| `mutex` | **1000 ×5** | **690–732** | 掉到与 `plain` 同水平 → 锁确实在起作用 |
+| `spin` | 1000 ×5 | 1000 ×5 | 未改动，仍精确 → 变化只来自被去掉的那把锁 |
+
+`mutex` 与 `plain` 的分布几乎重合（丢失率均约 27%），这是"两条路径都变成裸读-改-写"的有力旁证。
+
+恢复 mutex 后实测（同日）：`plain` 726–763，`atomic`/`mutex`/`spin` 均 1000 ×5 —— **有锁 → 去锁 → 恢复**三段闭环成立。
+
+| 阶段 | `plain` | `atomic` | `mutex` | `spin` |
+|---|---|---|---|---|
+| 有锁 | 712–778 | 1000 | **1000** | 1000 |
+| 去掉 mutex | 708–743 | 1000 | **690–732** | 1000 |
+| 恢复 mutex | 726–763 | 1000 | **1000** | 1000 |
+
+**实验 4（可选）：故意在自旋锁里睡眠**
+
+把 ④ 改成：
+
+```c
+spin_lock(&s_lock);
+tmp = cnt_spin;
+msleep(10);              /* ← 故意犯错 */
+cnt_spin = tmp + 1;
+spin_unlock(&s_lock);
+```
+
+加载后随便写一次设备，`dmesg` 会出现：
+
+```text
+BUG: sleeping function called from invalid context at kernel/locking/mutex.c:...
+in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: ..., name: sh
+Call Trace: ...
+```
+
+看到 `in_atomic(): 1` 就说明"在不该睡的地方睡了"。做完把 `msleep` 改回 `udelay`、重编重载。
+
+⚠️ 这一步会给内核打 taint（`cat /proc/sys/kernel/tainted` 非 0），不影响功能，但别在生产板上玩。
+
+**四种原语怎么选**
+
+| 原语 | 能睡眠 | 典型场景 | 代价 |
+|---|---|---|---|
+| `atomic_inc` / `atomic_read` | ❌ | 计数器、标志位（单变量） | 极低 |
+| `mutex_lock` | ✅ | 临界区里有 `copy_to_user`、`kmalloc(GFP_KERNEL)`、`msleep` | 中（有睡眠/唤醒） |
+| `spin_lock` | ❌ | 中断上下文、极短临界区（几行赋值） | 忙等 |
+| `spin_lock_irqsave` | ❌ | 同一数据也会被中断处理函数访问 | 同上，另关本 CPU 中断 |
+| `semaphore` | ✅ | 需要"计数"语义（多个持有者） | 同 mutex |
+| `completion` | ✅ | 等"某事件发生"，不保护数据 | 轻 |
+| RCU | ❌ 读者不阻塞 | 读多写少（链表遍历、路由表） | 需 copy-update |
+
+选择顺序：**能用原子变量就别用锁** → 需要睡眠用 mutex → 中断里只能 spinlock（且必须 `_irqsave`）→ 只是等事件用 completion → 读极多写极少用 RCU。
+
+**验收清单**
+
+- [ ] `stats` 四个计数器都能读
+- [ ] `plain` 明显 < 总数，且每轮波动
+- [ ] `atomic` / `mutex` / `spin` 每轮**恰好**等于总数
+- [ ] 注释掉任一把锁，对应计数器立刻开始丢更新
+- [ ] （可选）自旋锁里 `msleep` 触发 `BUG: sleeping function called from invalid context`
+- [ ] `rmmod` 后无 oops，`/dev/racedev` 消失
+
+**思考题**
+
+1. 把 `WIN_US` 设成 0 再跑 100 次，`plain` 还会丢吗？为什么（4 核对齐、编译器优化、指令乱序）？
+2. 若中断处理函数也改 `cnt_spin`，为什么必须 `spin_lock_irqsave` 而不是 `spin_lock`？
+3. `atomic_inc` 能保证"两个变量同时更新"的一致性吗？（不能——需要锁或 `cmpxchg` 循环）
 
 #### 步骤 1.4 定时器与内核线程（3 天）
 
@@ -809,6 +1338,7 @@ $ sudo rmmod mychar
 - [x] **内核编译成功**（2026-11-15）：`Image` 25M、`Module.symvers` 698K、`kernelrelease=4.19.232`、`grep -c Error`=0
 - [x] **`hello.ko` 在板上 `insmod` 成功**（2026-11-15，`dmesg` 输出 `Hello World Module Init`；阶段 0 毕业）
 - [x] **字符设备 `/dev/mychar` 跑通**（2026-11-15）：`major=236`，udev 自动建节点，写 15 字节读出一致，`rmmod` 干净退出
+- [x] **阶段 1.3 并发实验完成**（2026-11-22）：`race_demo` 四计数器对比，plain 712–778 波动、atomic/mutex/spin 恒 1000；去锁后 mutex 690–732，恢复后回 1000（三段闭环）
 - [ ] SSD1306 接线 + `i2cdetect -y 3` 扫到 `3c`
 
 ### 11.4 进展日志
@@ -820,6 +1350,7 @@ $ sudo rmmod mychar
 | 2026-11-15 夜间 | 链接 `vmlinux` 连续两次 OOM（根因：`vm.swappiness=0` + `ld` 要 1.18G 峰值）；设 `swappiness=100` + `KBUILD_LDFLAGS="--no-keep-memory --reduce-memory-overheads"` 后编过：`Image` 25M、`Module.symvers` 698K、`kernelrelease` 4.19.232、`Error`=0 |
 | 2026-11-15 深夜 | **阶段 0 毕业**：云上编出 `helloworld.ko`，板端 `sudo insmod` 打印 `Hello World Module Init`，`taints kernel` 属预期 |
 | 2026-11-15 夜 | **阶段 1.2 完成**：`/dev/mychar` 字符设备跑通（`major=236`、udev 自动建节点、写读一致、`rmmod` 无 oops）；踩坑：源码未保存导致 `.ko` 缺 `MODULE_LICENSE` |
+| 2026-11-22 下午 | **阶段 1.3 完成**：`02_race` 四计数器实验。有锁时 atomic/mutex/spin 恒 1000、plain 712–778；注释 mutex 后其掉到 690–732（与 plain 同分布）；恢复后回到 1000。踩坑：设备名 `race_dev` 与模块名 `race_demo` 混淆、`pr_info` 写死名字、重编后 `/dev` 节点权限重置需 sudo、忘加 sudo 导致 EACCES |
 
 ### 11.5 下次继续的三个入口
 
